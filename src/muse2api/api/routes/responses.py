@@ -26,10 +26,12 @@ from pydantic import BaseModel, ConfigDict
 from ...core.media import load_image_ref
 from ...core.models import resolve_model
 from ...core.prompt import flatten_messages, message_turns
+from ...core.tools import FINAL_INSTRUCTION, active_tools, inject
 from ...drivers.base import ChatRequest, InputImage
 from ...errors import InvalidRequest, Muse2APIError
 from ...services.container import Services
 from ..deps import get_services, require_api_key
+from .chat import collect_tool_reply
 
 log = logging.getLogger(__name__)
 router = APIRouter(tags=["responses"], dependencies=[Depends(require_api_key)])
@@ -56,8 +58,42 @@ class ResponseRequest(BaseModel):
 
 
 # Item types the official SDK round-trips but muse.ai cannot fulfil.
-_TOOL_ITEMS = {"function_call", "function_call_output", "reasoning", "computer_call",
-               "file_search_call", "web_search_call"}
+_TOOL_ITEMS = {"computer_call", "file_search_call", "web_search_call"}
+_CUSTOM_SCHEMA = {"type": "object", "required": ["input"], "properties": {
+    "input": {"type": "string", "description": "Raw freeform input for this tool"}}}
+
+
+def _output_text(output: Any) -> str:
+    if isinstance(output, list):
+        return "\n".join(p.get("text", "") for p in output if isinstance(p, dict))
+    return output if isinstance(output, str) else json.dumps(output, ensure_ascii=False)
+
+
+def _to_chat_tools(tools: list[dict] | None) -> tuple[list[dict], set[str]]:
+    """Responses tools -> chat-style function tools, plus the names of freeform tools."""
+    out: list[dict] = []
+    custom: set[str] = set()
+    for t in tools or []:
+        kind, name = t.get("type"), t.get("name")
+        if not name:
+            continue
+        if kind == "function":
+            out.append({"type": "function", "function": {
+                "name": name, "description": t.get("description", ""),
+                "parameters": t.get("parameters") or {"type": "object", "properties": {}}}})
+        elif kind == "custom":
+            custom.add(name)
+            fmt = (t.get("format") or {}).get("definition", "")
+            out.append({"type": "function", "function": {
+                "name": name, "parameters": _CUSTOM_SCHEMA,
+                "description": (t.get("description", "") + "\n" + fmt).strip()}})
+    return out, custom
+
+
+def _to_chat_choice(choice: Any) -> Any:
+    if isinstance(choice, dict) and choice.get("name"):
+        return {"type": "function", "function": {"name": choice["name"]}}
+    return choice if choice in ("none", "required") else "auto"
 
 
 def _to_messages(body: ResponseRequest) -> list[dict]:
@@ -77,9 +113,19 @@ def _to_messages(body: ResponseRequest) -> list[dict]:
             itype = item.get("type")
             if itype in _TOOL_ITEMS:
                 raise InvalidRequest(
-                    f"input item type '{itype}' is not supported: "
-                    "muse.ai has no function calling")
-            if "role" in item or itype in ("message", None):
+                    f"input item type '{itype}' is not supported by muse.ai")
+            if itype == "reasoning":
+                continue
+            if itype in ("function_call", "custom_tool_call"):
+                args = item.get("arguments") if itype == "function_call" else json.dumps(
+                    {"input": item.get("input", "")}, ensure_ascii=False)
+                messages.append({"role": "assistant", "content": None, "tool_calls": [{
+                    "id": item.get("call_id", ""), "type": "function",
+                    "function": {"name": item.get("name", ""), "arguments": args or "{}"}}]})
+            elif itype in ("function_call_output", "custom_tool_call_output"):
+                messages.append({"role": "tool", "tool_call_id": item.get("call_id", ""),
+                                 "content": _output_text(item.get("output"))})
+            elif "role" in item or itype in ("message", None):
                 messages.append({"role": item.get("role", "user"),
                                  "content": item.get("content")})
             else:
@@ -110,6 +156,67 @@ def _response_object(resp_id: str, msg_id: str, created: int, model: str, text: 
             "tool_choice": "auto", "tools": []}
 
 
+def _tool_output_response(body: ResponseRequest, resp_id: str, created: int, model: str,
+                          output: list[dict], input_text: str):
+    out_text = json.dumps(output, ensure_ascii=False)
+
+    def snapshot(status: str) -> dict:
+        return {"id": resp_id, "object": "response", "created_at": created, "model": model,
+                "status": status, "output": output if status == "completed" else [],
+                "usage": _usage(input_text, out_text), "parallel_tool_calls": True,
+                "tool_choice": "auto", "tools": []}
+
+    if not body.stream:
+        return snapshot("completed")
+
+    async def events() -> AsyncIterator[bytes]:
+        seq = 0
+
+        def ev(payload: dict) -> bytes:
+            nonlocal seq
+            payload["sequence_number"] = seq
+            seq += 1
+            return _sse(payload)
+
+        yield ev({"type": "response.created", "response": snapshot("in_progress")})
+        yield ev({"type": "response.in_progress", "response": snapshot("in_progress")})
+        for i, item in enumerate(output):
+            kind, iid = item["type"], item["id"]
+            if kind == "message":
+                text = item["content"][0]["text"]
+                yield ev({"type": "response.output_item.added", "output_index": i,
+                          "item": {**item, "status": "in_progress", "content": []}})
+                part = {"type": "output_text", "text": "", "annotations": []}
+                yield ev({"type": "response.content_part.added", "item_id": iid,
+                          "output_index": i, "content_index": 0, "part": part})
+                yield ev({"type": "response.output_text.delta", "item_id": iid,
+                          "output_index": i, "content_index": 0, "delta": text, "logprobs": []})
+                yield ev({"type": "response.output_text.done", "item_id": iid,
+                          "output_index": i, "content_index": 0, "text": text, "logprobs": []})
+                yield ev({"type": "response.content_part.done", "item_id": iid,
+                          "output_index": i, "content_index": 0,
+                          "part": item["content"][0]})
+            else:
+                custom = kind == "custom_tool_call"
+                field = "input" if custom else "arguments"
+                yield ev({"type": "response.output_item.added", "output_index": i,
+                          "item": {**item, "status": "in_progress", field: ""}})
+                prefix = "response.custom_tool_call_input" if custom else (
+                    "response.function_call_arguments")
+                yield ev({"type": f"{prefix}.delta", "item_id": iid, "output_index": i,
+                          "delta": item[field]})
+                done = {"type": f"{prefix}.done", "item_id": iid, "output_index": i,
+                        field: item[field]}
+                if not custom:
+                    done["name"] = item["name"]
+                yield ev(done)
+            yield ev({"type": "response.output_item.done", "output_index": i, "item": item})
+        yield ev({"type": "response.completed", "response": snapshot("completed")})
+
+    return StreamingResponse(events(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
 @router.post("/v1/responses")
 async def create_response(body: ResponseRequest, request: Request,
                           svc: Services = Depends(get_services)):
@@ -117,7 +224,12 @@ async def create_response(body: ResponseRequest, request: Request,
     spec = resolve_model(body.model, "chat")
     request.state.model = body.model or spec.id
     messages = _to_messages(body)
-    flat = flatten_messages(messages)
+    chat_tools, custom_names = _to_chat_tools(body.model_extra.get("tools"))
+    choice = _to_chat_choice(body.model_extra.get("tool_choice"))
+    tools = active_tools(chat_tools, choice)
+    if tools:
+        messages = inject(messages, tools, choice)
+    flat = flatten_messages(messages, FINAL_INSTRUCTION if tools else None)
     if not flat.text and not flat.images:
         raise InvalidRequest("input contains no text or images")
 
@@ -133,11 +245,36 @@ async def create_response(body: ResponseRequest, request: Request,
         turns=message_turns(messages),
         cancel=cancel,
     )
-    stream = svc.gateway.chat_stream(req)
     resp_id = "resp_" + uuid.uuid4().hex[:24]
     msg_id = "msg_" + uuid.uuid4().hex[:24]
     created = int(time.time())
     model_name = body.model or spec.id
+
+    if tools:
+        try:
+            parsed = await collect_tool_reply(svc, req, tools)
+        finally:
+            cancel.set()
+        output: list[dict] = []
+        if parsed.content or not parsed.tool_calls:
+            output.append(_message_item(msg_id, parsed.content))
+        for c in parsed.tool_calls:
+            fn, cid = c["function"], c["id"]
+            if fn["name"] in custom_names:
+                try:
+                    raw = json.loads(fn["arguments"]).get("input", "")
+                except (ValueError, AttributeError):
+                    raw = fn["arguments"]
+                output.append({"id": "ctc_" + cid[5:], "type": "custom_tool_call",
+                               "status": "completed", "call_id": cid, "name": fn["name"],
+                               "input": raw})
+            else:
+                output.append({"id": "fc_" + cid[5:], "type": "function_call",
+                               "status": "completed", "call_id": cid, "name": fn["name"],
+                               "arguments": fn["arguments"]})
+        return _tool_output_response(body, resp_id, created, model_name, output, flat.text)
+
+    stream = svc.gateway.chat_stream(req)
 
     if not body.stream:
         text = "".join([d async for d in stream])

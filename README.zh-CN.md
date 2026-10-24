@@ -325,7 +325,8 @@ curl http://localhost:18610/admin/accounts \
 
 - **验证与实测（先做）**：把测试跑通、用真实账号测浏览器 driver、验证在线视频生成和会话续期。
 - **Driver**：完善直连 HTTP driver（在线视频与额度查询）、会话复用降低首字延迟。
-- **协议层**：`/v1/responses`、mask 局部重绘、仿真 tool calling。
+- **协议层**：`/v1/responses`、mask 局部重绘。
+- **Tool calling（基于提示词的仿真）**：`/v1/chat/completions`（opencode 等）、`/v1/messages`（Claude Code）、`/v1/responses`（Codex）均支持 tools；带 tools 的回复为整段缓冲而非逐字流式，格式错误会重试一次。
 - **账号、管理与运维**：cookie 导入浏览器插件、存储后端、按 key 限流、Prometheus 指标。
 
 每个任务都写了位置、做法和完成标准。代码里标了 `TODO(contributors)` 的地方是预留的扩展点。

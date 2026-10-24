@@ -325,7 +325,8 @@ All reserved modules and outstanding work are tracked in **[TODO.md](TODO.md)**,
 
 - **Verification and live testing (do first)**: get the tests passing, test the browser driver against real accounts, and verify live video generation and session renewal.
 - **Drivers**: harden the direct HTTP driver (live video and quota lookup), conversation thread reuse.
-- **Protocol**: `/v1/responses`, mask-based inpainting, emulated tool calling.
+- **Protocol**: `/v1/responses`, mask-based inpainting.
+- **Tool calling (emulated, prompt-based)**: OpenAI `tools` on `/v1/chat/completions` (opencode, Cline...), Anthropic `tools` / `tool_use` on `/v1/messages` (Claude Code), and `function` / `custom` tools on `/v1/responses` (Codex). Tool replies are buffered rather than streamed token-by-token; a malformed call is retried once.
 - **Accounts, admin and operations**: cookie import browser extension, storage backends, per-key rate limits, Prometheus metrics.
 
 Each task lists its location, approach and definition of done. Places marked `TODO(contributors)` in the code are the reserved extension points.

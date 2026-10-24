@@ -258,10 +258,9 @@ def test_responses_rejects_bad_input(client, auth):
     empty = client.post("/v1/responses", headers=auth, json={"input": "  "})
     assert empty.status_code == 400
     tools = client.post("/v1/responses", headers=auth, json={
-        "input": [{"type": "function_call", "name": "get_weather",
-                   "arguments": "{}"}]})
+        "input": [{"type": "computer_call", "call_id": "c1"}]})
     assert tools.status_code == 400
-    assert "function calling" in tools.json()["error"]["message"]
+    assert "not supported" in tools.json()["error"]["message"]
 
 
 def _capture_image_requests(client, monkeypatch) -> list:

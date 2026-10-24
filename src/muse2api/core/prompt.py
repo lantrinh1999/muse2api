@@ -81,7 +81,7 @@ def followup_text(previous: list[tuple[str, str]], incoming: list[tuple[str, str
     return "\n\n".join(user_text)
 
 
-def flatten_messages(messages: list[dict[str, Any]]) -> FlatPrompt:
+def flatten_messages(messages: list[dict[str, Any]], instruction: str | None = None) -> FlatPrompt:
     images: list[str] = []
     turns: list[tuple[str, str]] = []
     for msg in messages:
@@ -99,7 +99,8 @@ def flatten_messages(messages: list[dict[str, Any]]) -> FlatPrompt:
 
     blocks = [f"[{ROLE_LABELS.get(role, role.title())}]\n{text}" for role, text in turns]
     blocks.append(
-        "[Instruction]\nContinue the conversation above and reply as the Assistant to the last "
-        "User message. Output only the reply."
+        "[Instruction]\n" + (instruction or (
+            "Continue the conversation above and reply as the Assistant to the last "
+            "User message. Output only the reply."))
     )
     return FlatPrompt(text="\n\n".join(blocks), images=images)

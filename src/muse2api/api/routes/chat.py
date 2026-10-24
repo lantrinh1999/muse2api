@@ -6,6 +6,7 @@ import logging
 import time
 import uuid
 from collections.abc import AsyncIterator
+from dataclasses import replace
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import StreamingResponse
@@ -13,6 +14,14 @@ from fastapi.responses import StreamingResponse
 from ...core.media import load_image_ref
 from ...core.models import resolve_model
 from ...core.prompt import flatten_messages, message_turns
+from ...core.tools import (
+    FINAL_INSTRUCTION,
+    REPAIR_INSTRUCTION,
+    ParsedReply,
+    active_tools,
+    inject,
+    parse_reply,
+)
 from ...drivers.base import ChatRequest, InputImage
 from ...errors import InvalidRequest, Muse2APIError
 from ...services.container import Services
@@ -32,13 +41,68 @@ def _sse(payload: dict | str) -> bytes:
     return f"data: {data}\n\n".encode()
 
 
+async def collect_tool_reply(svc: Services, req: ChatRequest,
+                             tools: list[dict]) -> ParsedReply:
+    """Run a tool-enabled chat, retrying once when the reply is a broken tool call."""
+    text = "".join([d async for d in svc.gateway.chat_stream(req)])
+    parsed = parse_reply(text, tools)
+    if parsed.malformed:
+        retry = replace(req, prompt=f"{req.prompt}\n\n[Instruction]\n{REPAIR_INSTRUCTION}",
+                        turns=[], conversation_hint=None)
+        text = "".join([d async for d in svc.gateway.chat_stream(retry)])
+        parsed = parse_reply(text, tools)
+        if parsed.malformed:  # still broken: hand the raw text back instead of failing
+            parsed = ParsedReply(text, [])
+    return parsed
+
+
+def _tool_response(body: ChatCompletionRequest, parsed, prompt: str, completion_id: str,
+                   created: int, model_name: str):
+    finish = "tool_calls" if parsed.tool_calls else "stop"
+    content = parsed.content or None
+    usage = {"prompt_tokens": _approx_tokens(prompt),
+             "completion_tokens": _approx_tokens(parsed.content + json.dumps(parsed.tool_calls))}
+    usage["total_tokens"] = usage["prompt_tokens"] + usage["completion_tokens"]
+    if not body.stream:
+        message: dict = {"role": "assistant", "content": content}
+        if parsed.tool_calls:
+            message["tool_calls"] = parsed.tool_calls
+        return {"id": completion_id, "object": "chat.completion", "created": created,
+                "model": model_name,
+                "choices": [{"index": 0, "message": message, "finish_reason": finish}],
+                "usage": usage}
+
+    def chunk(delta: dict, fin: str | None = None) -> dict:
+        return {"id": completion_id, "object": "chat.completion.chunk", "created": created,
+                "model": model_name,
+                "choices": [{"index": 0, "delta": delta, "finish_reason": fin}]}
+
+    async def events() -> AsyncIterator[bytes]:
+        yield _sse(chunk({"role": "assistant", "content": content or ""}))
+        if parsed.tool_calls:
+            yield _sse(chunk({"tool_calls": [{"index": i, **c}
+                                             for i, c in enumerate(parsed.tool_calls)]}))
+        yield _sse(chunk({}, finish))
+        if (body.stream_options or {}).get("include_usage"):
+            yield _sse({"id": completion_id, "object": "chat.completion.chunk",
+                        "created": created, "model": model_name, "choices": [], "usage": usage})
+        yield _sse("[DONE]")
+
+    return StreamingResponse(events(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
 @router.post("/v1/chat/completions")
 async def chat_completions(body: ChatCompletionRequest, request: Request,
                            svc: Services = Depends(get_services)):
     request.state.model = body.model  # logged even if it does not resolve
     spec = resolve_model(body.model, "chat")
     request.state.model = body.model or spec.id
-    flat = flatten_messages([m.model_dump() for m in body.messages])
+    messages = [m.model_dump() for m in body.messages]
+    tools = active_tools(body.tools, body.tool_choice)
+    if tools:
+        messages = inject(messages, tools, body.tool_choice)
+    flat = flatten_messages(messages, FINAL_INSTRUCTION if tools else None)
     if not flat.text and not flat.images:
         raise InvalidRequest("messages contain no text or images")
 
@@ -51,12 +115,20 @@ async def chat_completions(body: ChatCompletionRequest, request: Request,
         timeout=svc.settings.chat_timeout,
         first_token_timeout=svc.settings.first_token_timeout,
         conversation_hint=body.user,
-        turns=message_turns([m.model_dump() for m in body.messages]),
+        turns=message_turns(messages),
         cancel=cancel,
     )
     completion_id = "chatcmpl-" + uuid.uuid4().hex[:24]
     created = int(time.time())
     model_name = body.model or spec.id
+    if tools:
+        # Tool calls can only be recognised once the whole reply is in, so buffer it.
+        try:
+            parsed = await collect_tool_reply(svc, req, tools)
+        finally:
+            cancel.set()
+        return _tool_response(body, parsed, flat.text, completion_id, created, model_name)
+
     stream = svc.gateway.chat_stream(req)
 
     if not body.stream:
