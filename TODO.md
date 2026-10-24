@@ -18,7 +18,7 @@ Priorities: **P0** must be done first · **P1** core feature · **P2** better ex
 | A4 | Verify session renewal | P0 | `upstream/muse.py` | | Not started |
 | A5 | Verify the Docker image builds and runs | P1 | `Dockerfile` | | Not started |
 | A6 | Enable GitHub Actions CI | P1 | `.github/workflows/ci.yml` | | Done (workflow file in main) |
-| B1 | Direct HTTP protocol driver | P1 | `drivers/http/` | | Not started |
+| B1 | Direct HTTP protocol driver | P1 | `drivers/http/` | | Done (local; live chat/image checks pass; video blocked by upstream region restriction) |
 | B2 | Reuse conversation threads to cut first-token latency | P2 | `drivers/browser/` | | Done |
 | B3 | Quota lookup | P2 | `MuseDriver.quota` | | Partial (mock done; real-driver lookup open) |
 | C1 | `/v1/responses` endpoint | P1 | `api/routes/responses.py` | | Done (local; verified with the official OpenAI SDK streaming + non-streaming against the mock driver; real-account check pending) |
@@ -37,7 +37,7 @@ Priorities: **P0** must be done first · **P1** core feature · **P2** better ex
 
 ## A. Verification and live testing
 
-All v0.1 code is written but has never been run. This group must be done first; otherwise later work has no reliable foundation.
+Most v0.1 code is written, but the browser and long-running flows still need live verification. This group comes first; otherwise later work has no reliable foundation.
 
 ### A1 Install dependencies, get tests and lint passing · P0
 - Run `pip install -e '.[dev]'`, `pytest` and `ruff check .`, and fix every failure.
@@ -89,6 +89,7 @@ Talk to muse.ai's backend directly, without a browser. This removes Chromium and
 4. Implement image and video generation and attachment download.
 5. Use recorded real responses as test fixtures; CI must not contact the real service.
 - A more detailed step-by-step breakdown is in the docstring at the top of `drivers/http/driver.py`.
+- **Status (2026-10-24)**: implemented with live checks for text chat, chat image input, image generation/download, token bootstrap, and workspace upload/download/delete. Offline fixtures cover Noise/framing, discovery, event parsing and media presentation cards. The video generation path is implemented; a live attempt was rejected upstream because the test account's country/region is not eligible for video generation.
 - **Done when**: chat works with `MUSE2API_DRIVER=http` and passes the same API tests as the browser driver.
 
 ### B2 Reuse conversation threads to cut first-token latency · P2

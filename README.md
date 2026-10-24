@@ -38,7 +38,7 @@ muse2api turns muse.ai's chat, text-to-image and text-to-video features into sta
 
 The project focuses on **clean engineering and easy collaboration**:
 
-- **Pluggable drivers**: how we reach upstream is abstracted behind a `MuseDriver` interface. There are currently a mock driver and a browser (CDP) driver, plus a reserved slot for a direct-protocol (HTTP) driver. They are fully independent of each other.
+- **Pluggable drivers**: how we reach upstream is abstracted behind a `MuseDriver` interface. There are currently a mock driver, a browser (CDP) driver and a direct HTTP/Noise driver. They are fully independent of each other.
 - **Strict layering**: the protocol layer, service layer, account pool and drivers each have a single responsibility and can be developed and tested on their own.
 - **Fully async**: built on FastAPI + asyncio; the CDP client uses `websockets`, so no request ever blocks a thread.
 - **Account pool**: multiple scheduling strategies, per-account concurrency limits, cooldown after failures, automatic removal of expired sessions, and automatic failover to another account.
@@ -46,7 +46,7 @@ The project focuses on **clean engineering and easy collaboration**:
 
 ## Status
 
-> **Current**: the mock-driver test suite passes locally (81 tests, no network access) and CI runs on every push to main; the browser driver and the direct-protocol driver still need live testing against a real muse.ai account.
+> **Current**: the mock-driver test suite passes locally (no network access) and CI runs on every push to main. The direct HTTP driver has been live-tested for text chat, image input, image generation/download and workspace uploads. Live video generation is implemented but the test account is region-restricted by upstream; browser checks remain.
 
 | Module | Status | Notes |
 |---|---|---|
@@ -56,8 +56,8 @@ The project focuses on **clean engineering and easy collaboration**:
 | Admin API (account CRUD, renewal, reset, status) | ✅ Implemented | Accepts cookie dicts, raw `Cookie` header strings and EditThisCookie JSON, plus bulk import via `/admin/accounts/import`; per-account quota snapshot at `/admin/accounts/{id}/quota` |
 | Mock driver | ✅ Implemented | Offline fake data |
 | Browser driver (Chromium + CDP) | 🧪 Needs live testing | Full chat, image and video flows are written |
-| Session renewal / keepalive | 🧪 Needs live testing | Plain HTTP, disabled by default |
-| Direct HTTP protocol driver | 🚧 Reserved | Returns 501 |
+| Session renewal / keepalive | 🧪 Needs live testing | Plain HTTP, disabled by default; HTTP token refresh is implemented |
+| Direct HTTP protocol driver | ✅ Implemented | Noise WebSocket transport, chat/image input/image generation/download and workspace files live-tested. Video path is implemented; the test account's region restriction prevents a live video check. See [docs/protocol.md](docs/protocol.md) |
 | `/v1/images/edits` (reference images) | ✅ Implemented | Images are references for a new image; `mask` is rejected |
 | `/v1/responses` | 🚧 Reserved | Returns 501 |
 | Streaming heartbeats (SSE keepalive) | ✅ Implemented | Opt-in with `MUSE2API_STREAM_HEARTBEAT_INTERVAL`; sends `: keepalive` comments while waiting for the first token |
@@ -95,7 +95,7 @@ flowchart TB
         direction LR
         d_mock["mock<br/>offline fake data"]
         d_browser["browser<br/>Chromium + CDP"]
-        d_http["http<br/>direct protocol (reserved)"]
+        d_http["http<br/>direct Noise protocol"]
     end
 
     subgraph upstream["upstream/"]
@@ -114,7 +114,7 @@ flowchart TB
 
 For streaming requests, the first chunk is fetched before returning 200. Errors such as "no account available" or "upstream authentication failed" therefore come back with a proper HTTP status code instead of a stream that breaks halfway.
 
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full design.
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full design and [docs/protocol.md](docs/protocol.md) for the direct HTTP/Noise protocol.
 
 ## Project layout
 
@@ -138,10 +138,10 @@ muse2api/
 │   │   ├── base.py            # MuseDriver interface and data types
 │   │   ├── mock.py
 │   │   ├── browser/           # cdp.py / chromium.py / dom.py / driver.py
-│   │   └── http/              # Reserved
+│   │   └── http/              # auth.py / noise.py / events.py / driver.py
 │   └── upstream/muse.py       # Upstream constants and session renewal
-├── tests/                     # Mock-driver tests, no network access
-├── docs/ARCHITECTURE.md
+├── tests/                     # Mock-driver and offline protocol tests, no network access
+├── docs/ARCHITECTURE.md · docs/protocol.md
 ├── TODO.md                    # Task board for contributors
 ├── Dockerfile · docker-compose.yml · .env.example
 └── CONTRIBUTING.md
@@ -169,11 +169,20 @@ cp .env.example .env
 docker compose up -d --build
 ```
 
-### Use a real account (browser driver)
+### Use a real account
+
+Export the cookies from a browser that is logged in to muse.ai. At least `hatch_sess`, `hatch_vml` and `hatch_native_auth_device` are required (`hatch_gw` may appear in older exports); then import the account through the Admin API (see the example below).
+
+**HTTP driver (no Chromium)**
+
+1. Set `MUSE2API_DRIVER=http` in `.env`. The default install already includes `curl_cffi`, `cryptography` and `zstandard`.
+2. Start the service. It discovers the workspace, mints a short-lived gateway token and opens the Noise WebSocket directly.
+3. The driver creates an isolated muse.ai thread per API request and cleans up its uploaded reference files afterwards.
+
+**Browser driver**
 
 1. Install Chromium or Chrome and set `MUSE2API_DRIVER=browser` in `.env`.
-2. Export the cookies from a browser that is logged in to muse.ai. At least `hatch_sess`, `hatch_gw`, `hatch_vml` and `hatch_native_auth_device` are required.
-3. Import the account through the Admin API (see the example below).
+2. Start the service. The browser driver opens a persistent profile and one isolated tab per account.
 
 ## API examples
 
@@ -306,7 +315,7 @@ All settings come from environment variables (prefix `MUSE2API_`) or a `.env` fi
 | `MUSE2API_POOL_STRATEGY` | `lru` | Account scheduling: `lru` / `round_robin` / `affinity` |
 | `MUSE2API_MAX_FAILOVER` | `2` | Maximum number of retries on another account |
 | `MUSE2API_ACCOUNT_MAX_CONCURRENCY` | `1` | Parallel requests per account (browser driver: one tab each); 4 works well |
-| `MUSE2API_CHROMIUM_PATH` | auto-detected | Path to the browser executable |
+| `MUSE2API_CHROMIUM_PATH` | auto-detected | Path to the browser executable (browser driver only) |
 | `MUSE2API_KEEPALIVE_ENABLED` | `false` | Periodically renew sessions in the background |
 | `MUSE2API_MATTING_MODEL` | `birefnet-general` | Model for `background: "transparent"` (`birefnet-general-lite` is faster) |
 
@@ -314,8 +323,8 @@ All settings come from environment variables (prefix `MUSE2API_`) or a `.env` fi
 
 All reserved modules and outstanding work are tracked in **[TODO.md](TODO.md)**, in four groups:
 
-- **Verification and live testing (do first)**: get the tests passing, test the browser driver against real accounts, and verify image/video generation and session renewal.
-- **Drivers**: direct HTTP protocol driver, conversation thread reuse, quota lookup.
+- **Verification and live testing (do first)**: get the tests passing, test the browser driver against real accounts, and verify live video generation and session renewal.
+- **Drivers**: harden the direct HTTP driver (live video and quota lookup), conversation thread reuse.
 - **Protocol**: `/v1/responses`, mask-based inpainting, emulated tool calling.
 - **Accounts, admin and operations**: cookie import browser extension, storage backends, per-key rate limits, Prometheus metrics.
 
@@ -326,7 +335,7 @@ Each task lists its location, approach and definition of done. Places marked `TO
 You are welcome to pick up any task in [TODO.md](TODO.md). Please open an issue describing what you plan to do before you start; see [CONTRIBUTING.md](CONTRIBUTING.md) for conventions.
 
 ```bash
-pytest           # all tests use the mock driver
+pytest           # mock driver + offline HTTP protocol fixtures
 ruff check .     # lint
 ```
 

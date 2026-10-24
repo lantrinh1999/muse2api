@@ -18,6 +18,11 @@ dependencies = [
     "httpx[socks]>=0.27",
     "websockets>=13.0",
     "python-multipart>=0.0.9",
+    # Direct HTTP/Noise driver (no Chromium): gateway token, Noise handshake and
+    # zstd-compressed NDJSON events.
+    "curl_cffi>=0.13",
+    "cryptography>=42",
+    "zstandard>=0.23",
 ]
 
 [project.optional-dependencies]

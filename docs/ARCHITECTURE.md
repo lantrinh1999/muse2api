@@ -40,7 +40,7 @@ flowchart TB
         drv_base["base.py<br/>MuseDriver interface"]
         drv_mock["mock.py<br/>offline driver"]
         drv_browser["browser/<br/>Chromium + CDP"]
-        drv_http["http/<br/>direct protocol (reserved)"]
+        drv_http["http/<br/>direct Noise protocol"]
         drv_registry["registry.py"]
     end
 
@@ -95,6 +95,18 @@ class MuseDriver(ABC):
 - Text is written into the textarea through the native value setter plus an `input` event, so React picks it up and long prompts stay fast. If the send button cannot be found, it falls back to pressing Enter.
 - Output detection polls the text of the last assistant bubble and emits the new part. The reply is considered finished once the Stop button is gone and the text has stopped changing.
 - Media: wait for a new attachment node, then `fetch()` its `blob:` URL inside the page and return the bytes as base64.
+
+## HTTP / Noise driver notes
+
+The HTTP driver replaces the browser with the same protocol the web client uses. It is selected with `MUSE2API_DRIVER=http`; no Chromium is required.
+
+- **Bootstrap**: `auth.py` loads `/thread/new` with `curl_cffi` (Chrome TLS fingerprint), reads the active `gatewayUrl`/`vmName`, and mints a five-minute hatch token at `/api/hatch/token`. Grants are cached per account and keyed by a hash of the cookie values.
+- **Transport**: `noise.py` opens `wss://hatch.metaaivm.com/v1/noise` and runs `Noise_XX_25519_AESGCM_SHA256`. HTTP requests and responses are protobuf envelopes inside encrypted WebSocket frames. Unary requests and long-lived NDJSON subscriptions share the same tunnel.
+- **Threads**: one isolated thread is created per API call by sending `/chat/stream` with a fresh UUID as `session_id`. The driver subscribes to `/chat/subscribe` immediately and reconciles transient `delta.text_append` events with the final transcript in `delta.message_done`.
+- **Media generation**: generated images/videos are delivered as `delta.presentation` cards, usually separately from `message_done`. `events.py` extracts `data.images`/`data.videos`, `image_path`/`video_path` and markdown fallbacks, normalises them to `sandbox://workspace/...`, and the driver downloads them with `/fs/raw/...`.
+- **Workspace files**: reference images are uploaded in 512 KiB chunks with `/fs/write`; every upload is deleted in the call's `finally` block. Paths must be relative (`workspace/...`).
+- **Error handling**: transport resets/closes and gateway JSON errors are mapped to `Upstream*` errors. A failed handshake invalidates the cached token and retries once; the account pool can still fail over before any client output.
+- **Limitations**: the protocol is undocumented and may change. HLS/m3u8 video playlists are not remuxed, quota lookup is not wired yet, and the test account used for live checks is blocked from video generation by an upstream region restriction. See [protocol.md](protocol.md) for the wire format.
 
 ## Roadmap
 

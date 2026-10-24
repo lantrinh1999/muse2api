@@ -11,3 +11,20 @@ services:
     volumes:
       - ./data:/app/data
     shm_size: "1gb"
+    init: true
+    security_opt:
+      - seccomp:unconfined
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    mem_limit: 2g
+    cpus: 1.5
+    pids_limit: 1024
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:18610/healthz', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s

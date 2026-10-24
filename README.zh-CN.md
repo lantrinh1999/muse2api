@@ -38,7 +38,7 @@ muse2api 把 muse.ai 的聊天、文生图和文生视频能力变成标准的 O
 
 项目注重**工程干净和协作友好**：
 
-- **可插拔 driver**：访问上游的方式被抽象在 `MuseDriver` 接口后面。目前有一个 mock driver 和一个浏览器（CDP）driver，还为直连协议（HTTP）driver 预留了位置。三者完全独立。
+- **可插拔 driver**：访问上游的方式被抽象在 `MuseDriver` 接口后面。目前有一个 mock driver、一个浏览器（CDP）driver 和一个直连 HTTP/Noise driver。三者完全独立。
 - **严格分层**：协议层、服务层、账号池、driver 各司其职，可以单独开发和测试。
 - **全异步**：基于 FastAPI + asyncio；CDP 客户端用 `websockets`，没有任何请求会阻塞线程。
 - **账号池**：多种调度策略、按账号的并发限制、失败后冷却、过期会话自动剔除、自动故障转移。
@@ -46,7 +46,7 @@ muse2api 把 muse.ai 的聊天、文生图和文生视频能力变成标准的 O
 
 ## 状态
 
-> **当前**：本地 mock-driver 测试套件通过（81 个测试，无需网络），每次推送到 main 都会跑 CI；浏览器 driver 和直连协议 driver 仍需用真实 muse.ai 账号做实测。
+> **当前**：本地 mock-driver 测试套件通过（无需网络），每次推送到 main 都会跑 CI。直连 HTTP driver 已完成真实账号的文本聊天、图片输入、图片生成/下载和 workspace 文件流程实测。在线视频路径已实现，但测试账号被上游按地区限制，暂时无法实测；浏览器流程仍需实测。
 
 | 模块 | 状态 | 备注 |
 |---|---|---|
@@ -56,8 +56,8 @@ muse2api 把 muse.ai 的聊天、文生图和文生视频能力变成标准的 O
 | Admin API（账号增删改查、续期、重置、状态） | ✅ 已实现 | 支持 cookie 字典、原始 `Cookie` 请求头字符串、EditThisCookie JSON 三种导入格式，还有批量导入接口 `/admin/accounts/import`；单账号额度快照 `/admin/accounts/{id}/quota` |
 | Mock driver | ✅ 已实现 | 离线假数据 |
 | 浏览器 driver（Chromium + CDP） | 🧪 待实测 | 聊天、图片、视频全流程已写好 |
-| 会话续期 / 保活 | 🧪 待实测 | 纯 HTTP，默认关闭 |
-| 直连 HTTP 协议 driver | 🚧 预留 | 返回 501 |
+| 会话续期 / 保活 | 🧪 待实测 | 纯 HTTP，默认关闭；HTTP token 刷新已实现 |
+| 直连 HTTP 协议 driver | ✅ 已实现 | Noise WebSocket、聊天/图片输入/图片生成下载、workspace 文件流程已实测。视频路径已实现，但测试账号被上游按地区限制，无法在线实测。见 [docs/protocol.md](docs/protocol.md) |
 | `/v1/images/edits`（参考图） | ✅ 已实现 | 参考图用于生成新图；不支持 `mask` |
 | `/v1/responses` | 🚧 预留 | 返回 501 |
 | 流式心跳（SSE keepalive） | ✅ 已实现 | 用 `MUSE2API_STREAM_HEARTBEAT_INTERVAL` 开启；等第一个 token 期间发送 `: keepalive` 注释 |
@@ -95,7 +95,7 @@ flowchart TB
         direction LR
         d_mock["mock<br/>离线假数据"]
         d_browser["browser<br/>Chromium + CDP"]
-        d_http["http<br/>直连协议（预留）"]
+        d_http["http<br/>直连 Noise 协议"]
     end
 
     subgraph upstream["upstream/"]
@@ -114,7 +114,7 @@ flowchart TB
 
 流式请求先拿到第一个 chunk 再返回 200。这样「没有可用账号」「上游鉴权失败」这类错误会以正常的 HTTP 状态码返回，而不是断在流中间。
 
-完整设计见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
+完整设计见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)，直连 HTTP/Noise 协议见 [docs/protocol.md](docs/protocol.md)。
 
 ## 项目结构
 
@@ -138,10 +138,10 @@ muse2api/
 │   │   ├── base.py            # MuseDriver 接口与数据类型
 │   │   ├── mock.py
 │   │   ├── browser/           # cdp.py / chromium.py / dom.py / driver.py
-│   │   └── http/              # 预留
+│   │   └── http/              # auth.py / noise.py / events.py / driver.py
 │   └── upstream/muse.py       # 上游常量与会话续期
-├── tests/                     # mock-driver 测试，无网络访问
-├── docs/ARCHITECTURE.md
+├── tests/                     # mock-driver 与离线协议测试，无网络访问
+├── docs/ARCHITECTURE.md · docs/protocol.md
 ├── TODO.md                    # 贡献者任务板
 ├── Dockerfile · docker-compose.yml · .env.example
 └── CONTRIBUTING.md
@@ -169,11 +169,20 @@ cp .env.example .env
 docker compose up -d --build
 ```
 
-### 用真实账号（浏览器 driver）
+### 用真实账号
+
+从已登录 muse.ai 的浏览器导出 cookies。至少需要 `hatch_sess`、`hatch_vml` 和 `hatch_native_auth_device`（旧版导出里可能还有 `hatch_gw`），然后通过下面的 Admin API 示例把账号导进来。
+
+**HTTP driver（不需要 Chromium）**
+
+1. 在 `.env` 里设置 `MUSE2API_DRIVER=http`。默认安装已包含 `curl_cffi`、`cryptography` 和 `zstandard`。
+2. 启动服务。它会自动发现 workspace、获取短期 gateway token，并直接打开 Noise WebSocket。
+3. driver 会为每个 API 请求创建独立的 muse.ai thread，并在结束后清理上传的参考文件。
+
+**浏览器 driver**
 
 1. 装好 Chromium 或 Chrome，在 `.env` 里设置 `MUSE2API_DRIVER=browser`。
-2. 从已登录 muse.ai 的浏览器导出 cookies。至少需要 `hatch_sess`、`hatch_gw`、`hatch_vml` 和 `hatch_native_auth_device`。
-3. 通过下面的 Admin API 示例把账号导进来。
+2. 启动服务。浏览器 driver 会使用持久化 profile，并为每个账号创建独立标签页。
 
 ## 接口示例
 
@@ -306,7 +315,7 @@ curl http://localhost:18610/admin/accounts \
 | `MUSE2API_POOL_STRATEGY` | `lru` | 账号调度：`lru` / `round_robin` / `affinity` |
 | `MUSE2API_MAX_FAILOVER` | `2` | 换账号重试的最大次数 |
 | `MUSE2API_ACCOUNT_MAX_CONCURRENCY` | `1` | 每个账号的并行请求数（browser driver：每请求一个 tab）；4 比较好用 |
-| `MUSE2API_CHROMIUM_PATH` | 自动探测 | 浏览器可执行文件路径 |
+| `MUSE2API_CHROMIUM_PATH` | 自动探测 | 浏览器可执行文件路径（仅浏览器 driver） |
 | `MUSE2API_KEEPALIVE_ENABLED` | `false` | 后台定期续期会话 |
 | `MUSE2API_MATTING_MODEL` | `birefnet-general` | `background: "transparent"` 用的抠图模型（`birefnet-general-lite` 更快） |
 
@@ -314,8 +323,8 @@ curl http://localhost:18610/admin/accounts \
 
 所有预留模块和未完成的工作都在 **[TODO.md](TODO.md)** 里跟踪，分四组：
 
-- **验证与实测（先做）**：把测试跑通、用真实账号测浏览器 driver、验证图片/视频生成和会话续期。
-- **Driver**：直连 HTTP 协议 driver、会话复用降首字延迟、额度查询。
+- **验证与实测（先做）**：把测试跑通、用真实账号测浏览器 driver、验证在线视频生成和会话续期。
+- **Driver**：完善直连 HTTP driver（在线视频与额度查询）、会话复用降低首字延迟。
 - **协议层**：`/v1/responses`、mask 局部重绘、仿真 tool calling。
 - **账号、管理与运维**：cookie 导入浏览器插件、存储后端、按 key 限流、Prometheus 指标。
 
@@ -326,7 +335,7 @@ curl http://localhost:18610/admin/accounts \
 欢迎从 [TODO.md](TODO.md) 里认领任务。动手前请先开一个 issue 说明你的计划；规范见 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
 ```bash
-pytest           # 所有测试都用 mock driver
+pytest           # mock driver + 离线 HTTP 协议测试
 ruff check .     # lint
 ```
 

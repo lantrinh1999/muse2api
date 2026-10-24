@@ -20,7 +20,9 @@ SESSION_API = f"{SITE}/api/session"
 VM_WAKE_API = f"{SITE}/api/hatch/vm/wake"
 
 # Cookies that together make up a logged-in session.
-SESSION_COOKIES = ("hatch_sess", "hatch_gw", "hatch_vml", "hatch_native_auth_device")
+# `hatch_gw` is no longer issued by the muse.ai web app (observed 2026-10), so it
+# must not be required; demanding it made every freshly exported account invalid.
+SESSION_COOKIES = ("hatch_sess", "hatch_vml", "hatch_native_auth_device")
 
 USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -62,21 +64,32 @@ async def renew_session(
             if c.expires:
                 expires[c.name] = int(c.expires)
 
-        body = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
-        meta = {"session_status": body.get("status"), "vm_id": body.get("vm_id"),
-                "vm_state": body.get("vm_state")}
+        body = (
+            resp.json()
+            if resp.headers.get("content-type", "").startswith("application/json")
+            else {}
+        )
+        meta = {
+            "session_status": body.get("status"),
+            "vm_id": body.get("vm_id"),
+            "vm_state": body.get("vm_state"),
+        }
 
         if wake_vm and meta["vm_id"] and meta["vm_state"] != "DISABLED":
             try:
                 w = await client.post(
                     VM_WAKE_API,
                     headers={"Cookie": cookie_header(jar)},
-                    json={"vm_id": meta["vm_id"], "retry_count": 0,
-                          "connect_attempt_id": str(uuid.uuid4())},
+                    json={
+                        "vm_id": meta["vm_id"],
+                        "retry_count": 0,
+                        "connect_attempt_id": str(uuid.uuid4()),
+                    },
                 )
                 meta["vm_wake_ok"] = w.status_code == 200
             except httpx.HTTPError:
                 meta["vm_wake_ok"] = False
 
-    return SessionInfo(ok=meta["session_status"] == "assigned", cookies=jar,
-                       cookie_expires=expires, meta=meta)
+    return SessionInfo(
+        ok=meta["session_status"] == "assigned", cookies=jar, cookie_expires=expires, meta=meta
+    )
