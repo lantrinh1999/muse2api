@@ -16,10 +16,12 @@ from ...core.models import resolve_model
 from ...core.prompt import flatten_messages, message_turns
 from ...core.tools import (
     FINAL_INSTRUCTION,
+    NUDGE_INSTRUCTION,
     REPAIR_INSTRUCTION,
     ParsedReply,
     active_tools,
     inject,
+    looks_unfulfilled,
     parse_reply,
 )
 from ...drivers.base import ChatRequest, InputImage
@@ -43,16 +45,25 @@ def _sse(payload: dict | str) -> bytes:
 
 async def collect_tool_reply(svc: Services, req: ChatRequest,
                              tools: list[dict]) -> ParsedReply:
-    """Run a tool-enabled chat, retrying once when the reply is a broken tool call."""
+    """Run a tool-enabled chat, retrying once when the reply is a broken tool call or
+    announces an action without calling a tool."""
     text = "".join([d async for d in svc.gateway.chat_stream(req)])
     parsed = parse_reply(text, tools)
-    if parsed.malformed:
-        retry = replace(req, prompt=f"{req.prompt}\n\n[Instruction]\n{REPAIR_INSTRUCTION}",
+    for _ in range(2):
+        if parsed.malformed:
+            nudge = REPAIR_INSTRUCTION
+        elif not parsed.tool_calls and looks_unfulfilled(parsed.content):
+            # Show the model its own announcement so it follows through with the call.
+            nudge = f"[Assistant]\n{parsed.content}\n\n[Instruction]\n{NUDGE_INSTRUCTION}"
+        else:
+            break
+        retry = replace(req, prompt=f"{req.prompt}\n\n{nudge}" if nudge.startswith("[") else
+                        f"{req.prompt}\n\n[Instruction]\n{nudge}",
                         turns=[], conversation_hint=None)
         text = "".join([d async for d in svc.gateway.chat_stream(retry)])
         parsed = parse_reply(text, tools)
-        if parsed.malformed:  # still broken: hand the raw text back instead of failing
-            parsed = ParsedReply(text, [])
+    if parsed.malformed:  # still no valid call: hand back plain text, never an error
+        parsed = ParsedReply(text, [])
     return parsed
 
 

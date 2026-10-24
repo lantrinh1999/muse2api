@@ -23,8 +23,19 @@ _FENCE_RE = re.compile(r"^```(?:json)?\s*(.*?)\s*```$", re.S)
 
 FINAL_INSTRUCTION = (
     "Continue the conversation above and reply as the Assistant to the last message. "
-    "Output only the reply."
+    "Output only the reply. If the task needs you to look at, search, read, edit or run "
+    f"anything, your reply MUST contain the {OPEN_TAG}...{CLOSE_TAG} block right now. Never "
+    "say you are going to do something without including the block in that same reply: a "
+    "reply without the block is treated as your final answer."
 )
+NUDGE_INSTRUCTION = (
+    "You said what you are going to do but did not call a tool, so nothing happened. "
+    f"Reply now with ONLY the {OPEN_TAG}[...]{CLOSE_TAG} block for that action."
+)
+_INTENT_RE = re.compile(
+    r"(tôi sẽ|mình sẽ|để tôi|để mình|tiếp theo|bây giờ tôi|bây giờ mình|i['’]ll |i will |"
+    r"i['’]m going to|let me |let['’]s |i need to |first,? i|next,? i|now i|going to )",
+    re.I)
 
 
 REPAIR_INSTRUCTION = (
@@ -62,6 +73,12 @@ def _missing_required(args: str, schema: dict[str, Any]) -> bool:
     except ValueError:
         return True
     return not isinstance(data, dict) or any(k not in data for k in required)
+
+
+def looks_unfulfilled(text: str) -> bool:
+    """A short reply announcing an action (or ending on a colon) with no tool call."""
+    t = text.strip()
+    return bool(t) and len(t) < 600 and (bool(_INTENT_RE.search(t)) or t.endswith(":"))
 
 
 def active_tools(tools: list[dict[str, Any]] | None, tool_choice: Any) -> list[dict[str, Any]]:

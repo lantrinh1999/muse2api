@@ -242,3 +242,28 @@ def test_responses_stream_and_history(settings, auth):
                 {"type": "function_call_output", "call_id": "call_1", "output": "print(1)"}]})
     assert r.json()["output"][0]["type"] == "message"
     assert "[Tool result: read_file]" in driver.prompts[0]
+
+
+def test_announced_action_is_nudged(settings, auth):
+    class Lazy(ScriptedDriver):
+        async def chat_stream(self, account, req):
+            self.prompts.append(req.prompt)
+            yield "Tôi sẽ bắt đầu khám phá cấu trúc dự án." if len(self.prompts) == 1 else CALL
+
+    driver = Lazy("")
+    with TestClient(create_app(settings, driver)) as c:
+        r = c.post("/v1/chat/completions", headers=auth, json={
+            "model": "muse-chat", "tools": TOOLS,
+            "messages": [{"role": "user", "content": "phân tích dự án này"}]})
+    assert r.json()["choices"][0]["finish_reason"] == "tool_calls"
+    assert "did not call a tool" in driver.prompts[1]
+
+
+def test_final_answer_is_not_nudged(settings, auth):
+    client, driver = _client(settings, "The file prints 1.")
+    with client as c:
+        r = c.post("/v1/chat/completions", headers=auth, json={
+            "model": "muse-chat", "tools": TOOLS,
+            "messages": [{"role": "user", "content": "what does it print?"}]})
+    assert r.json()["choices"][0]["message"]["content"] == "The file prints 1."
+    assert len(driver.prompts) == 1
